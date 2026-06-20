@@ -66,5 +66,6 @@ async function checkFixedWindowWithLua(key, limit, windowSeconds){
     )
     return {allowed: result[0] === 1, remaining: parseInt(result[1]), reset: parseInt(result[2])};
 }
+
 export {checkFixedWindowTrulyNaive};
 export default checkFixedWindowWithLua;

@@ -232,7 +232,26 @@ docker compose up -d redis
 ```bash
 npm test
 ```
-Runs the Vitest suite, including the concurrency test described above.
+
+The suite covers four layers:
+
+- **Per-algorithm unit tests** (`tests/fixedWindow.test.js`, `slidingWindowLog.test.js`,
+  `tokenBucket.test.js`) — for each algorithm: allowed while under the limit, blocked once
+  over it, and allowed again after the window/refill recovers.
+- **Concurrency test** (`tests/concurrency.test.js`) — the naive-vs-atomic proof described
+  above.
+- **Integration tests** (`tests/check.integration.test.js`) — real HTTP requests against the
+  Express app via `supertest`, covering algorithm routing through the `?algorithm=` query
+  param and the `/health` route.
+
+```
+ Test Files  1 failed | 4 passed (5)
+      Tests  1 failed | 15 passed (16)
+```
+
+The one failing test is the naive concurrency test from the section above — it's expected to
+fail and is left failing on purpose, as a visible, running proof that the bug it documents is
+real (rather than being silently skipped or asserted away).
 
 ## Project Status
 
@@ -244,7 +263,7 @@ Built and documented in stages, following an explicit phase-by-phase roadmap:
 - [x] Phase 3 — Sliding window log (Redis sorted sets)
 - [x] Phase 4 — Token bucket + atomicity via Lua; fixed window rewritten atomically;
       concurrency test proving naive vs. atomic behavior
-- [ ] Phase 5 — Broader test suite (per-algorithm unit tests, integration tests on `/check`)
+- [x] Phase 5 — Broader test suite (per-algorithm unit tests, integration tests on `/check`)
 - [ ] Phase 6 — Config cleanup, input validation, error handling middleware, request logging
 - [ ] Phase 7 (stretch) — Publishable Express middleware package
 - [ ] Phase 8 (stretch) — Live stats dashboard
@@ -252,5 +271,5 @@ Built and documented in stages, following an explicit phase-by-phase roadmap:
 
 ## What's next
 
-Phase 5 onward — see the roadmap in this repo for the full plan, including load testing
+Phase 6 onward — see the roadmap in this repo for the full plan, including load testing
 results and scaling considerations that will be added once those phases are complete.
