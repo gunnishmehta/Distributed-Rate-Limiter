@@ -22,26 +22,84 @@ one, prove it with a test, and then close it with an atomic Redis/Lua script.
 - **Docker Compose** — Redis + app running as two containers
 - **Vitest** — unit and concurrency tests
 
+## Architecture
+
+```
+                        ┌─────────────────────┐
+   HTTP request         │   Express app.js     │
+  ───────────────────▶  │                       │
+   POST /check           │  morgan (logging)     │
+   ?algorithm=...        │  express.json()       │
+                        │  validateCheckRequest  │  ← zod: reject bad input early,
+                        │   (zod)                │     apply config defaults
+                        │  route → algorithm fn  │
+                        │  errorHandler          │  ← centralized, catches everything
+                        └──────────┬────────────┘
+                                   │
+                                   ▼
+                  ┌────────────────────────────────┐
+                  │   src/algorithms/*.js            │
+                  │   (fixedWindow / slidingWindowLog │
+                  │    / tokenBucket)                 │
+                  └──────────────┬─────────────────┘
+                                 │  one atomic round trip
+                                 ▼
+                  ┌────────────────────────────────┐
+                  │   Redis (single instance)        │
+                  │   EVAL <lua script>               │ ← INCR/EXPIRE/TTL,
+                  │   (single-threaded, single        │   ZADD/ZREMRANGEBYSCORE/ZCARD,
+                  │    ioredis connection)             │   or HGETALL/HSET, all atomic
+                  └────────────────────────────────┘
+
+   Separately, the same algorithm logic (Lua-backed only) is packaged as a
+   standalone, installable Express middleware — see "Standalone Middleware
+   Package" below. It takes its own injected Redis client; it does not share
+   a connection with the service above.
+```
+
+Two artifacts, one Redis-backed core: a runnable HTTP service (`src/`) and a reusable
+middleware library (`packages/rate-limiter-middleware/`), both built on the same
+atomic-via-Lua algorithms.
+
 ## Project Structure
 
 ```
 .
 ├── docker-compose.yml          # redis + node-app services
 ├── Dockerfile
-├── .env                        # REDIS_HOST, REDIS_PORT, NODE_APP_PORT
+├── .env                        # REDIS_HOST, REDIS_PORT, NODE_APP_PORT, DEFAULT_LIMIT,
+│                                 DEFAULT_WINDOW_SECONDS
 ├── src/
-│   ├── server.js                # Express app, routes
+│   ├── server.js                 # entry point: imports app.js, calls app.listen
+│   ├── app.js                     # Express app + routes (no listen) — importable by tests
+│   ├── config.js                  # centralized env reads with defaults
 │   ├── redis/
-│   │   ├── client.js             # single shared ioredis instance
+│   │   ├── client.js               # single shared ioredis instance (+ error handler)
 │   │   └── scripts/
-│   │       ├── fixedWindow.lua    # atomic fixed window (INCR + EXPIRE + TTL)
-│   │       └── tokenBucket.lua    # atomic token bucket (read-refill-consume)
-│   └── algorithms/
-│       ├── fixedWindow.js         # naive, "truly naive", and Lua-backed versions
-│       ├── slidingWindowLog.js    # Redis sorted-set (ZADD/ZREMRANGEBYSCORE/ZCARD) based
-│       └── tokenBucket.js         # plain-JS and Lua-backed versions
+│   │       ├── fixedWindow.lua      # atomic fixed window (INCR + EXPIRE + TTL)
+│   │       └── tokenBucket.lua      # atomic token bucket (read-refill-consume)
+│   ├── algorithms/
+│   │   ├── fixedWindow.js          # naive, "truly naive", and Lua-backed versions
+│   │   ├── slidingWindowLog.js     # Redis sorted-set (ZADD/ZREMRANGEBYSCORE/ZCARD) based
+│   │   └── tokenBucket.js          # plain-JS and Lua-backed versions
+│   ├── middleware/
+│   │   ├── validateCheckRequest.js  # zod validation for POST /check
+│   │   └── errorHandler.js          # centralized error-handling middleware
+│   └── validation/
+│       └── checkSchema.js          # zod schemas (request body, algorithm enum)
+├── packages/
+│   └── rate-limiter-middleware/   # standalone, installable Express middleware
+│       ├── package.json
+│       ├── index.js                 # rateLimiter(options) factory
+│       ├── algorithms/               # Lua-backed only (no naive/demo versions)
+│       ├── scripts/
+│       └── README.md
 └── tests/
-    └── concurrency.test.js       # proves the race condition, and proves the fix
+    ├── concurrency.test.js        # proves the race condition, and proves the fix
+    ├── fixedWindow.test.js         # per-algorithm unit tests
+    ├── slidingWindowLog.test.js
+    ├── tokenBucket.test.js
+    └── check.integration.test.js  # real HTTP requests via supertest
 ```
 
 ## Algorithms
@@ -253,6 +311,114 @@ The one failing test is the naive concurrency test from the section above — it
 fail and is left failing on purpose, as a visible, running proof that the bug it documents is
 real (rather than being silently skipped or asserted away).
 
+## Load Testing
+
+Load tested locally with `autocannon` against `POST /check` (fixed window algorithm, app and
+Redis both running via Docker Compose on the same machine as the load generator).
+
+### Baseline (limit high enough that requests are essentially always allowed)
+
+| Concurrency | Avg req/sec | p50 latency | p99 latency | Max latency | Errors |
+|---|---|---|---|---|---|
+| 50 | 5,016.9 | 8ms | 32ms | 562ms | 0 |
+| 200 | 5,688.3 | 33ms | 45ms | 2,049ms | 0 |
+| 500 | 5,254.1 | 68ms | 114ms | 9,986ms | **14 timeouts** |
+
+### Rejection path (limit low enough that nearly all requests are blocked, c=50)
+
+| Avg req/sec | p50 latency | p99 latency | Max latency |
+|---|---|---|---|
+| 5,308.7 | 8ms | 17ms | 316ms |
+
+### Findings
+
+- **Allowing and rejecting a request cost essentially the same.** p50 latency was identical
+  (8ms) whether the Lua script allowed or rejected — both paths do the same fundamental work:
+  one atomic round trip to Redis. There's no cheap shortcut for either branch.
+- **Throughput hit a hard ceiling around ~5,000-5,700 req/sec, independent of concurrency.**
+  50, 200, and 500 concurrent connections all converged on roughly the same throughput.
+  Quadrupling concurrency from 50 → 200 only bought a 13% throughput increase — the extra
+  concurrency was absorbed almost entirely as *added latency* (p50 went from 8ms to 33ms,
+  closely tracking Little's Law: `concurrency ≈ throughput × latency`).
+- **The actual breaking point was between c=200 and c=500.** At `c=500`, 14 out of ~53,000
+  requests (~0.026%) timed out outright, and max latency spiked to nearly 10 seconds. Below
+  that, the system degraded gracefully (slower, not broken); at that point it started actually
+  dropping requests.
+- **The likely bottleneck is the single Redis connection, not Node/Express.** Every request
+  does exactly one `EVAL` call over `ioredis`'s single TCP connection to a single-threaded
+  Redis instance. However much HTTP concurrency Node accepts, it all funnels through that one
+  pipe — which is consistent with throughput plateauing regardless of concurrency.
+
+### Caveat
+
+The load generator and the system under test ran on the same machine. At high concurrency,
+some of the measured degradation may reflect local CPU/network contention between the test
+client and the server, not purely the server's own limits. A more rigorous test would run
+`autocannon` from a separate machine.
+
+## What I'd Do Differently at Scale
+
+- **Multiple Redis connections / a connection pool**, instead of a single shared `ioredis`
+  instance, to remove the single-pipe bottleneck the load test pointed at directly.
+- **Redis Cluster, sharded by rate-limit key**, so no single Redis node has to serialize every
+  request across the whole service — each key's traffic would only contend with other keys
+  hashed to the same shard.
+- **Horizontal scaling of the Node service itself.** Since all rate-limit state lives in
+  Redis and the app holds no in-process state, running multiple Node instances behind a load
+  balancer is safe by construction — this would help if Node/Express were the bottleneck, but
+  the load test suggests Redis would need addressing first.
+- **A fail-open vs. fail-closed decision for Redis outages.** Right now, if Redis is
+  unreachable, requests fail loudly (`500`, via the centralized error handler) rather than
+  picking a deliberate fallback. At scale, you'd want to explicitly decide: should a Redis
+  outage block all traffic (fail-closed, safer but riskier for availability), or let requests
+  through unmetered (fail-open, safer for availability but loses rate limiting exactly when
+  load is high)?
+- **Multi-region considerations.** A single Redis instance is a single point of failure and a
+  latency penalty for geographically distant clients. Real multi-region rate limiting needs
+  either regional Redis instances with relaxed global accuracy, or a globally consistent store
+  accepting higher latency per check.
+- **Consistent response shapes across algorithms.** `tokenBucket` currently returns
+  `{ allowed, tokens }` while the other two return `{ allowed, remaining, reset }` — fine for
+  a learning project, but worth unifying before treating this as a real shared library.
+- **Real observability** (structured logs, metrics, tracing) instead of `morgan` — explicitly
+  deferred per the roadmap to a future project, but the natural next step after this one.
+
+## Standalone Middleware Package
+
+Alongside the service itself, the rate-limiting logic is also packaged as a reusable,
+installable Express middleware — `packages/rate-limiter-middleware/`. Unlike the service,
+which owns its own Redis connection and config, the package takes a Redis client as input
+and exposes a single factory function:
+
+```js
+import { rateLimiter } from "rate-limiter-middleware";
+
+app.use(
+  rateLimiter({
+    redisClient,            // any client exposing eval/zadd/zremrangebyscore/zcard/pttl/expire
+    algorithm: "tokenBucket", // "fixedWindow" | "slidingWindowLog" | "tokenBucket"
+    limit: 100,
+    windowSeconds: 60,
+  })
+);
+```
+
+It ships only the atomic, Lua-backed version of each algorithm (the naive/demonstration
+versions used to prove the race condition stay in the main service, where that story lives).
+See [packages/rate-limiter-middleware/README.md](packages/rate-limiter-middleware/README.md)
+for full usage docs (`keyGenerator`, `onRejected`, response shapes).
+
+It was verified as genuinely installable end-to-end: built with `npm pack` into a real
+`.tgz`, installed into a completely separate project folder with `npm install <tarball>`,
+and exercised there with its own Express app and Redis client — confirming requests were
+correctly allowed and then blocked with `429` once the limit was hit, independent of this
+repo entirely.
+
+The main service intentionally keeps its own separate copy of the algorithm logic rather than
+importing from the package — per the roadmap, the goal here was two distinct artifacts from
+one project (a standalone service *and* a reusable library), not a single shared
+implementation.
+
 ## Project Status
 
 Built and documented in stages, following an explicit phase-by-phase roadmap:
@@ -264,12 +430,13 @@ Built and documented in stages, following an explicit phase-by-phase roadmap:
 - [x] Phase 4 — Token bucket + atomicity via Lua; fixed window rewritten atomically;
       concurrency test proving naive vs. atomic behavior
 - [x] Phase 5 — Broader test suite (per-algorithm unit tests, integration tests on `/check`)
-- [ ] Phase 6 — Config cleanup, input validation, error handling middleware, request logging
-- [ ] Phase 7 (stretch) — Publishable Express middleware package
+- [x] Phase 6 — Config defaults, input validation (zod), centralized error handling,
+      request logging (morgan)
+- [x] Phase 7 (stretch) — Publishable Express middleware package
 - [ ] Phase 8 (stretch) — Live stats dashboard
-- [ ] Phase 9 — Load testing, final documentation pass
+- [x] Phase 9 — Load testing, final documentation pass
 
 ## What's next
 
-Phase 6 onward — see the roadmap in this repo for the full plan, including load testing
-results and scaling considerations that will be added once those phases are complete.
+Phase 8 (stretch) — a live dashboard polling Redis for active rate-limiter keys — is the one
+remaining item, deliberately left for later since it's marked optional in the roadmap.

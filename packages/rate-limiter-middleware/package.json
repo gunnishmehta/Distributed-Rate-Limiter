@@ -1,0 +1,27 @@
+{
+  "name": "rate-limiter-middleware",
+  "version": "1.0.0",
+  "description": "Express middleware for distributed rate limiting backed by Redis. Supports fixed window, sliding window log, and token bucket algorithms.",
+  "main": "index.js",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "algorithms",
+    "scripts",
+    "README.md"
+  ],
+  "keywords": [
+    "rate-limiter",
+    "express",
+    "redis",
+    "middleware",
+    "token-bucket"
+  ],
+  "license": "ISC",
+  "peerDependencies": {
+    "express": ">=4.0.0"
+  }
+}
