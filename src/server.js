@@ -3,6 +3,7 @@ import express from "express";
 
 import redisClient from "./redis/client.js";
 import checkFixedWindow from "./algorithms/fixedWindow.js";
+import checkSlidingWindowLog from "./algorithms/slidingWindowLog.js";
 
 const app = express();
 app.use(express.json());
@@ -22,8 +23,16 @@ app.get("/health", async (req, res) => {
 
 app.post("/check", async (req, res) => {
     const {key, limit, windowSeconds} = req.body;
+    const algorithm = req.query.algorithm;
     try{
-        const result = await checkFixedWindow(key, limit, Number(windowSeconds));
+        let result;
+        if (algorithm === "slidingWindowLog") {
+            result = await checkSlidingWindowLog(key, limit, Number(windowSeconds));
+            console.log("Sliding Window Log Result:", result);
+        } else {
+            result = await checkFixedWindow(key, limit, Number(windowSeconds));
+            console.log("Fixed Window Result:", result);
+        }
         res.json(result);
     }catch (error) {
         res.status(500).json({ status: "Error", message: error.message });
