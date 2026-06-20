@@ -2,8 +2,10 @@ import "dotenv/config";
 import express from "express";
 
 import redisClient from "./redis/client.js";
-import checkFixedWindow from "./algorithms/fixedWindow.js";
+
+import checkFixedWindowWithLua from "./algorithms/fixedWindow.js";
 import checkSlidingWindowLog from "./algorithms/slidingWindowLog.js";
+import checkTokenBucketWithLua from "./algorithms/tokenBucket.js";
 
 const app = express();
 app.use(express.json());
@@ -28,10 +30,10 @@ app.post("/check", async (req, res) => {
         let result;
         if (algorithm === "slidingWindowLog") {
             result = await checkSlidingWindowLog(key, limit, Number(windowSeconds));
-            console.log("Sliding Window Log Result:", result);
+        } else if (algorithm === "tokenBucket") {
+            result = await checkTokenBucketWithLua(key, limit, Number(windowSeconds));
         } else {
-            result = await checkFixedWindow(key, limit, Number(windowSeconds));
-            console.log("Fixed Window Result:", result);
+            result = await checkFixedWindowWithLua(key, limit, Number(windowSeconds));
         }
         res.json(result);
     }catch (error) {
